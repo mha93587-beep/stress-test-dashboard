@@ -1,7 +1,8 @@
 """
-🔥 Stress Test Dashboard — Streamlit Frontend with SQLite Persistence
-Pure Python asyncio-based load tester with SQLite state persistence.
-Survives browser refresh, tab close, and multi-client access.
+🔥 Stress Test Dashboard — Streamlit Cloud Production Ready
+Engineered with SQLite persistence, automatic schema migration,
+connection pooling to prevent OS socket exhaustion (Errno 24),
+and @st.fragment for zero-flicker, crash-proof live updates.
 """
 
 import os
@@ -21,11 +22,10 @@ import streamlit as st
 
 
 # ============================================
-# DATABASE & PROCESS WORKER SETUP
+# DATABASE & WORKER SETUP
 # ============================================
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stress_test.db")
 
-# Process-level worker tracking surviving Streamlit script reruns
 if not hasattr(sys, "_stress_test_workers"):
     sys._stress_test_workers = {}
 WORKERS = sys._stress_test_workers
@@ -33,68 +33,121 @@ WORKERS_LOCK = threading.Lock()
 
 
 def get_db():
-    """Returns a new SQLite connection with WAL mode enabled for high concurrency."""
-    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+    """Thread-safe SQLite connection with WAL mode and generous busy timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn.execute("PRAGMA busy_timeout = 60000;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
 
 def init_db():
-    """Initializes the database schema if not present."""
-    with get_db() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            target_url TEXT NOT NULL,
-            status TEXT NOT NULL,
-            timeout_sec INTEGER NOT NULL,
-            stages_text TEXT NOT NULL,
-            peak_users INTEGER DEFAULT 0,
-            total_duration INTEGER DEFAULT 0,
-            active_users INTEGER DEFAULT 0,
-            total_requests INTEGER DEFAULT 0,
-            successful INTEGER DEFAULT 0,
-            failed INTEGER DEFAULT 0,
-            status_5xx INTEGER DEFAULT 0,
-            timeouts INTEGER DEFAULT 0,
-            conn_errors INTEGER DEFAULT 0,
-            rps REAL DEFAULT 0.0,
-            error_rate REAL DEFAULT 0.0,
-            avg_ms INTEGER DEFAULT 0,
-            p50_ms INTEGER DEFAULT 0,
-            p95_ms INTEGER DEFAULT 0,
-            p99_ms INTEGER DEFAULT 0,
-            max_ms INTEGER DEFAULT 0,
-            status_codes_json TEXT DEFAULT '{}',
-            elapsed_sec INTEGER DEFAULT 0,
-            stop_requested INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP,
-            finished_at TIMESTAMP
-        );
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            message TEXT NOT NULL,
-            FOREIGN KEY (job_id) REFERENCES jobs(id)
-        );
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id, id);")
-        conn.commit()
+    """Initializes tables and automatically migrates any missing columns."""
+    try:
+        with get_db() as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                timeout_sec INTEGER NOT NULL,
+                stages_text TEXT NOT NULL,
+                peak_users INTEGER DEFAULT 0,
+                total_duration INTEGER DEFAULT 0,
+                active_users INTEGER DEFAULT 0,
+                total_requests INTEGER DEFAULT 0,
+                successful INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                status_5xx INTEGER DEFAULT 0,
+                timeouts INTEGER DEFAULT 0,
+                conn_errors INTEGER DEFAULT 0,
+                rps REAL DEFAULT 0.0,
+                error_rate REAL DEFAULT 0.0,
+                avg_ms INTEGER DEFAULT 0,
+                p50_ms INTEGER DEFAULT 0,
+                p95_ms INTEGER DEFAULT 0,
+                p99_ms INTEGER DEFAULT 0,
+                max_ms INTEGER DEFAULT 0,
+                status_codes_json TEXT DEFAULT '{}',
+                elapsed_sec INTEGER DEFAULT 0,
+                stop_requested INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            );
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                message TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id)
+            );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id, id);")
+            
+            # Auto-migrate any missing columns for backwards compatibility
+            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            expected_cols = {
+                "active_users": "INTEGER DEFAULT 0",
+                "total_requests": "INTEGER DEFAULT 0",
+                "successful": "INTEGER DEFAULT 0",
+                "failed": "INTEGER DEFAULT 0",
+                "status_5xx": "INTEGER DEFAULT 0",
+                "timeouts": "INTEGER DEFAULT 0",
+                "conn_errors": "INTEGER DEFAULT 0",
+                "rps": "REAL DEFAULT 0.0",
+                "error_rate": "REAL DEFAULT 0.0",
+                "avg_ms": "INTEGER DEFAULT 0",
+                "p50_ms": "INTEGER DEFAULT 0",
+                "p95_ms": "INTEGER DEFAULT 0",
+                "p99_ms": "INTEGER DEFAULT 0",
+                "max_ms": "INTEGER DEFAULT 0",
+                "status_codes_json": "TEXT DEFAULT '{}'",
+                "elapsed_sec": "INTEGER DEFAULT 0",
+                "stop_requested": "INTEGER DEFAULT 0",
+                "finished_at": "TIMESTAMP",
+            }
+            for col, col_type in expected_cols.items():
+                if col not in existing_cols:
+                    try:
+                        conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
+                    except Exception:
+                        pass
+            conn.commit()
+    except Exception as e:
+        print(f"Warning during DB initialization: {e}")
 
 
-# Initialize DB on load
+# Initialize schema on launch
 init_db()
 
 
 # ============================================
-# DATABASE HELPER FUNCTIONS
+# SAFE DATA HELPERS
+# ============================================
+def safe_int(val, default: int = 0) -> int:
+    try:
+        if val is None:
+            return default
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_float(val, default: float = 0.0) -> float:
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+# ============================================
+# DATABASE INTERACTION HELPERS
 # ============================================
 def create_job(target_url: str, stages_text: str, timeout_sec: int, peak_users: int, total_duration: int) -> int:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -112,127 +165,154 @@ def create_job(target_url: str, stages_text: str, timeout_sec: int, peak_users: 
 
 def add_log(job_id: int, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO logs (job_id, timestamp, message) VALUES (?, ?, ?)",
-            (job_id, timestamp, message)
-        )
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO logs (job_id, timestamp, message) VALUES (?, ?, ?)",
+                (job_id, timestamp, message)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to log message: {e}")
 
 
 def update_job_metrics(job_id: int, metrics: dict):
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE jobs SET
-                active_users = ?,
-                total_requests = ?,
-                successful = ?,
-                failed = ?,
-                status_5xx = ?,
-                timeouts = ?,
-                conn_errors = ?,
-                rps = ?,
-                error_rate = ?,
-                avg_ms = ?,
-                p50_ms = ?,
-                p95_ms = ?,
-                p99_ms = ?,
-                max_ms = ?,
-                status_codes_json = ?,
-                elapsed_sec = ?
-            WHERE id = ?
-        """, (
-            metrics.get("active_users", 0),
-            metrics.get("total_requests", 0),
-            metrics.get("successful", 0),
-            metrics.get("failed", 0),
-            metrics.get("status_5xx", 0),
-            metrics.get("timeouts", 0),
-            metrics.get("conn_errors", metrics.get("connection_errors", 0)),
-            metrics.get("rps", 0.0),
-            metrics.get("error_rate", 0.0),
-            metrics.get("avg_response_ms", metrics.get("avg_ms", 0)),
-            metrics.get("p50_ms", 0),
-            metrics.get("p95_ms", 0),
-            metrics.get("p99_ms", 0),
-            metrics.get("max_ms", 0),
-            json.dumps(metrics.get("status_codes", {})),
-            metrics.get("elapsed", metrics.get("elapsed_sec", 0)),
-            job_id
-        ))
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                UPDATE jobs SET
+                    active_users = ?,
+                    total_requests = ?,
+                    successful = ?,
+                    failed = ?,
+                    status_5xx = ?,
+                    timeouts = ?,
+                    conn_errors = ?,
+                    rps = ?,
+                    error_rate = ?,
+                    avg_ms = ?,
+                    p50_ms = ?,
+                    p95_ms = ?,
+                    p99_ms = ?,
+                    max_ms = ?,
+                    status_codes_json = ?,
+                    elapsed_sec = ?
+                WHERE id = ?
+            """, (
+                safe_int(metrics.get("active_users")),
+                safe_int(metrics.get("total_requests")),
+                safe_int(metrics.get("successful")),
+                safe_int(metrics.get("failed")),
+                safe_int(metrics.get("status_5xx")),
+                safe_int(metrics.get("timeouts")),
+                safe_int(metrics.get("conn_errors", metrics.get("connection_errors"))),
+                safe_float(metrics.get("rps")),
+                safe_float(metrics.get("error_rate")),
+                safe_int(metrics.get("avg_response_ms", metrics.get("avg_ms"))),
+                safe_int(metrics.get("p50_ms")),
+                safe_int(metrics.get("p95_ms")),
+                safe_int(metrics.get("p99_ms")),
+                safe_int(metrics.get("max_ms")),
+                json.dumps(metrics.get("status_codes", {})),
+                safe_int(metrics.get("elapsed", metrics.get("elapsed_sec"))),
+                job_id
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to update metrics: {e}")
 
 
 def mark_job_status(job_id: int, status: str):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE jobs SET status = ?, finished_at = ? WHERE id = ?
-        """, (status, now_str, job_id))
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                UPDATE jobs SET status = ?, finished_at = ? WHERE id = ?
+            """, (status, now_str, job_id))
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to mark job status: {e}")
 
 
 def request_stop_job(job_id: int):
-    with get_db() as conn:
-        conn.execute("UPDATE jobs SET stop_requested = 1 WHERE id = ?", (job_id,))
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE jobs SET stop_requested = 1 WHERE id = ?", (job_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to request stop: {e}")
 
 
 def is_stop_requested(job_id: int) -> bool:
-    with get_db() as conn:
-        row = conn.execute("SELECT stop_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        return bool(row and row["stop_requested"] == 1)
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT stop_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return bool(row and row["stop_requested"] == 1)
+    except Exception:
+        return False
 
 
 def get_job(job_id: int) -> Optional[dict]:
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        return dict(row) if row else None
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
 
 
 def get_active_job() -> Optional[dict]:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM jobs WHERE status = 'RUNNING' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if not row:
-            return None
-        
-        job = dict(row)
-        job_id = job["id"]
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE status = 'RUNNING' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            
+            job = dict(row)
+            job_id = job["id"]
 
-        # Check if the worker thread is actually alive
-        with WORKERS_LOCK:
-            t = WORKERS.get(job_id)
-            is_alive = t is not None and t.is_alive()
+            with WORKERS_LOCK:
+                t = WORKERS.get(job_id)
+                is_alive = t is not None and t.is_alive()
 
-        # If recorded as RUNNING but thread is dead (e.g. server restarted or crashed), update status
-        if not is_alive:
-            mark_job_status(job_id, "STOPPED")
-            job["status"] = "STOPPED"
-        return job
+            if not is_alive:
+                mark_job_status(job_id, "STOPPED")
+                job["status"] = "STOPPED"
+            return job
+    except Exception:
+        return None
 
 
 def get_latest_job() -> Optional[dict]:
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
-        return dict(row) if row else None
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
 
 
-def get_all_jobs(limit: int = 15) -> List[dict]:
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(r) for r in rows]
+def get_all_jobs(limit: int = 20) -> List[dict]:
+    try:
+        with get_db() as conn:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def get_recent_logs(job_id: int, limit: int = 250) -> List[str]:
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT timestamp, message FROM logs WHERE job_id = ? ORDER BY id DESC LIMIT ?",
-            (job_id, limit)
-        ).fetchall()
-        # Return in ascending chronological order
-        return [f"[{r['timestamp']}] {r['message']}" for r in reversed(rows)]
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, message FROM logs WHERE job_id = ? ORDER BY id DESC LIMIT ?",
+                (job_id, limit)
+            ).fetchall()
+            return [f"[{r['timestamp']}] {r['message']}" for r in reversed(rows)]
+    except Exception:
+        return []
 
 
 # ============================================
@@ -288,7 +368,7 @@ class LiveMetrics:
             "active_users": active_users,
             "rps": round(rps, 1),
             "error_rate": round(
-                self.failed / self.total_requests * 100 if self.total_requests else 0, 2
+                self.failed / self.total_requests * 100 if self.total_requests else 0.0, 2
             ),
             "avg_response_ms": round(
                 sum(self.response_times) / len(self.response_times) * 1000
@@ -355,9 +435,10 @@ def current_target(stages: List[Tuple[int, int]], elapsed: float) -> int:
 
 
 # ============================================
-# ASYNC ENGINE (ISOLATED WORKER)
+# ASYNC ENGINE WITH CLOUD SAFE CONNECTION POOLING
 # ============================================
-async def virtual_user_loop(session, target_url: str, timeout_sec: int, metrics: LiveMetrics, stop_event: asyncio.Event):
+async def virtual_user_worker(session, target_url: str, timeout_sec: int, metrics: LiveMetrics, stop_event: asyncio.Event):
+    """Worker task that repeatedly fires HTTP requests until stopped."""
     while not stop_event.is_set():
         start = time.perf_counter()
         status = 0
@@ -382,27 +463,34 @@ async def virtual_user_loop(session, target_url: str, timeout_sec: int, metrics:
         duration = time.perf_counter() - start
         await metrics.record(status, duration, error)
 
+        # Non-blocking pause between requests (0.05s to 0.5s for fast throughput)
         try:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await asyncio.sleep(random.uniform(0.05, 0.4))
         except asyncio.CancelledError:
             return
 
 
-async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple[int, int]], timeout_sec: int):
-    """Main async load test engine running in a detached thread."""
+async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple[int, int]], timeout_sec: int, max_concurrency: int):
+    """
+    Asynchronous load engine.
+    Uses worker pool architecture to generate massive traffic
+    while strictly capping open sockets under OS limits (preventing Errno 24).
+    """
     metrics = LiveMetrics()
     stop_event = asyncio.Event()
     total_duration = sum(d for d, _ in stages)
     active_tasks = []
     start_time = time.time()
+    peak_simulated = max(u for _, u in stages)
 
-    add_log(job_id, f"🚀 Job #{job_id} started: Target={target_url}, Duration={total_duration}s, Peak Users={max(u for _, u in stages):,}")
+    add_log(job_id, f"🚀 Job #{job_id} started: Target={target_url}")
+    add_log(job_id, f"⚙️ Config: Duration={total_duration}s | Target Users={peak_simulated:,} | Concurrency Cap={max_concurrency} tasks")
 
+    # Safe TCPConnector limit prevents 'Errno 24: Too many open files' on container environments
     connector = aiohttp.TCPConnector(
-        limit=0,
-        limit_per_host=0,
+        limit=max_concurrency,
+        limit_per_host=max_concurrency,
         ttl_dns_cache=300,
-        force_close=False,
         enable_cleanup_closed=True,
     )
 
@@ -417,7 +505,6 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
             last_metric_update = 0.0
 
             while True:
-                # Check stop request from SQLite
                 if is_stop_requested(job_id):
                     add_log(job_id, "🛑 Stop signal received. Gracefully terminating virtual users...")
                     break
@@ -427,27 +514,29 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
                     add_log(job_id, "🏁 All load stages completed successfully.")
                     break
 
-                target = current_target(stages, elapsed)
+                simulated_users = current_target(stages, elapsed)
+                # Scale actual worker tasks up to the user-defined max_concurrency cap
+                target_tasks = min(simulated_users, max_concurrency)
 
-                # Spawn users
-                while len(active_tasks) < target:
+                # Spawn worker tasks
+                while len(active_tasks) < target_tasks:
                     t = asyncio.create_task(
-                        virtual_user_loop(session, target_url, timeout_sec, metrics, stop_event)
+                        virtual_user_worker(session, target_url, timeout_sec, metrics, stop_event)
                     )
                     active_tasks.append(t)
-                    if len(active_tasks) % 200 == 0:
+                    if len(active_tasks) % 50 == 0:
                         await asyncio.sleep(0)
 
-                # Despawn excess users
-                while len(active_tasks) > target:
+                # Despawn excess tasks
+                while len(active_tasks) > target_tasks:
                     t = active_tasks.pop()
                     t.cancel()
 
-                # Update SQLite metrics every 2 seconds
+                # Commit metrics every 2 seconds
                 if elapsed - last_metric_update >= 2.0:
                     last_metric_update = elapsed
                     rps = metrics.total_requests / max(elapsed, 1.0)
-                    metrics_data = metrics.to_dict(len(active_tasks), rps, elapsed)
+                    metrics_data = metrics.to_dict(simulated_users, rps, elapsed)
                     update_job_metrics(job_id, metrics_data)
 
                     err_rate = (
@@ -456,7 +545,8 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
                     )
                     log_line = (
                         f"⏱ {elapsed:>5.0f}s | "
-                        f"👥 Users: {len(active_tasks):>6,} | "
+                        f"👥 Users: {simulated_users:>6,} | "
+                        f"⚡ Tasks: {len(active_tasks):>4} | "
                         f"📨 Req: {metrics.total_requests:>8,} | "
                         f"⚡ RPS: {rps:>7.1f} | "
                         f"❌ Err: {err_rate:>5.2f}%"
@@ -468,7 +558,6 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
     except Exception as e:
         add_log(job_id, f"⚠️ Engine exception: {type(e).__name__}: {str(e)}")
     finally:
-        # Cleanup
         stop_event.set()
         for t in active_tasks:
             t.cancel()
@@ -480,7 +569,6 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
         final_metrics = metrics.to_dict(0, rps, elapsed)
         update_job_metrics(job_id, final_metrics)
 
-        # Final Summary Log
         final_report = (
             f"📊 FINAL REPORT\n"
             f"   Total Requests : {metrics.total_requests:,}\n"
@@ -496,12 +584,14 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
         add_log(job_id, f"🏁 Job #{job_id} marked as {final_status}.")
 
 
-def background_worker(job_id: int, target_url: str, stages: List[Tuple[int, int]], timeout_sec: int):
-    """Entry point for the background OS thread."""
+def background_worker(job_id: int, target_url: str, stages: List[Tuple[int, int]], timeout_sec: int, max_concurrency: int):
+    """Worker thread running isolated from Streamlit's lifecycle."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(run_stress_test_async(job_id, target_url, stages, timeout_sec))
+        loop.run_until_complete(
+            run_stress_test_async(job_id, target_url, stages, timeout_sec, max_concurrency)
+        )
     except Exception as e:
         add_log(job_id, f"⚠️ Fatal worker error: {type(e).__name__}: {str(e)}")
         mark_job_status(job_id, "FAILED")
@@ -525,13 +615,6 @@ st.markdown("""
 <style>
     .stApp {
         background: linear-gradient(135deg, #0a0c1b, #1b1a38, #16182c);
-    }
-    .metric-card {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        padding: 16px;
-        text-align: center;
     }
     .log-box {
         background: #090d16;
@@ -571,10 +654,10 @@ st.markdown("""
 
 
 # ============================================
-# SIDEBAR CONTROLS
+# SIDEBAR CONFIGURATION
 # ============================================
 with st.sidebar:
-    st.markdown("## ⚙️ Configuration")
+    st.markdown("## ⚙️ Test Configuration")
     st.markdown("---")
 
     target_url = st.text_input(
@@ -592,6 +675,15 @@ with st.sidebar:
         step=5,
     )
 
+    max_concurrency = st.slider(
+        "⚡ Concurrency Cap (Worker Tasks)",
+        min_value=25,
+        max_value=500,
+        value=200,
+        step=25,
+        help="Maximum concurrent asynchronous tasks to prevent container crash / socket exhaustion on Streamlit Cloud.",
+    )
+
     st.markdown("---")
     st.markdown("### 📊 Load Stages")
     st.caption("Format: `duration_sec, target_users` (one per line)")
@@ -599,7 +691,7 @@ with st.sidebar:
     stages_text = st.text_area(
         "Stages Configuration",
         value=DEFAULT_STAGES_TEXT,
-        height=260,
+        height=240,
         label_visibility="collapsed",
     )
 
@@ -613,16 +705,15 @@ with st.sidebar:
         st.error("❌ No valid stages defined")
 
     st.markdown("---")
-    auto_refresh = st.checkbox("🔄 Auto-refresh live data (2s)", value=True)
 
     # Job History Selector
-    all_jobs = get_all_jobs(limit=15)
-    st.markdown("---")
+    all_jobs = get_all_jobs(limit=20)
     st.markdown("### 📜 Job History")
     job_options = {}
     for j in all_jobs:
-        status_icon = "🟢" if j["status"] == "RUNNING" else "✅" if j["status"] == "COMPLETED" else "🛑"
-        job_options[j["id"]] = f"Job #{j['id']} {status_icon} ({j['target_url'][:25]})"
+        status_icon = "🟢" if j.get("status") == "RUNNING" else "✅" if j.get("status") == "COMPLETED" else "🛑"
+        url_part = str(j.get("target_url", ""))[:25]
+        job_options[j["id"]] = f"Job #{j['id']} {status_icon} ({url_part})"
 
     selected_job_id = None
     if job_options:
@@ -638,24 +729,23 @@ with st.sidebar:
 
 
 # ============================================
-# DETERMINE ACTIVE JOB
+# ACTIVE JOB RESOLUTION
 # ============================================
-# Check if there is an active running job in SQLite
 current_running_job = get_active_job()
 
-# If user selected a job from history dropdown, show that job; otherwise show current active or latest job
 if current_running_job:
-    display_job = current_running_job
+    display_job_id = current_running_job["id"]
 elif selected_job_id:
-    display_job = get_job(selected_job_id)
+    display_job_id = selected_job_id
 else:
-    display_job = get_latest_job()
+    latest = get_latest_job()
+    display_job_id = latest["id"] if latest else None
 
 is_running = bool(current_running_job)
 
 
 # ============================================
-# MAIN DASHBOARD UI
+# MAIN HEADER & CONTROLS
 # ============================================
 st.markdown("# 🔥 Stress Test Dashboard")
 st.markdown("*High-performance load testing engine with SQLite state persistence*")
@@ -673,10 +763,9 @@ with c_btn1:
             target_url.strip(), stages_text, timeout_sec, peak, total_dur
         )
         
-        # Start worker thread
         t = threading.Thread(
             target=background_worker,
-            args=(new_job_id, target_url.strip(), parsed_stages, timeout_sec),
+            args=(new_job_id, target_url.strip(), parsed_stages, timeout_sec, max_concurrency),
             daemon=True,
         )
         with WORKERS_LOCK:
@@ -700,26 +789,39 @@ with c_btn3:
         st.rerun()
 
 with c_status:
-    if display_job:
-        status_text = display_job["status"]
-        job_num = display_job["id"]
-        target = display_job["target_url"]
-        if status_text == "RUNNING":
-            st.markdown(f'<p class="status-running">● TEST RUNNING — Job #{job_num} ({target})</p>', unsafe_allow_html=True)
-        elif status_text == "COMPLETED":
-            st.markdown(f'<p class="status-completed">✔ COMPLETED — Job #{job_num} ({target})</p>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<p class="status-stopped">■ {status_text} — Job #{job_num} ({target})</p>', unsafe_allow_html=True)
+    if current_running_job:
+        st.markdown(f'<p class="status-running">● TEST RUNNING — Job #{current_running_job["id"]} ({current_running_job.get("target_url")})</p>', unsafe_allow_html=True)
+    elif display_job_id:
+        dj = get_job(display_job_id)
+        if dj:
+            st_val = dj.get("status", "IDLE")
+            icon = "✔" if st_val == "COMPLETED" else "■"
+            cls = "status-completed" if st_val == "COMPLETED" else "status-stopped"
+            st.markdown(f'<p class="{cls}">{icon} {st_val} — Job #{dj["id"]} ({dj.get("target_url")})</p>', unsafe_allow_html=True)
     else:
         st.markdown('<p class="status-idle">○ IDLE — Configure target URL & click Start Test</p>', unsafe_allow_html=True)
 
 st.markdown("---")
 
+
 # ============================================
-# METRICS DISPLAY
+# LIVE DASHBOARD (ISOLATED VIA ST.FRAGMENT)
 # ============================================
-if display_job:
-    j = display_job
+@st.fragment(run_every=2 if is_running else None)
+def render_live_dashboard(job_id: Optional[int]):
+    """
+    Renders metrics and live logs seamlessly.
+    Automatically refreshes every 2 seconds when running without full page reload.
+    """
+    if not job_id:
+        st.info("👈 Enter a target URL in the sidebar and click **Start Test** to begin!")
+        return
+
+    j = get_job(job_id)
+    if not j:
+        st.warning(f"Job #{job_id} not found in database.")
+        return
+
     status_codes = {}
     if j.get("status_codes_json"):
         try:
@@ -730,24 +832,24 @@ if display_job:
     # Metrics row 1
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("👥 Active Users", f"{j['active_users']:,}")
+        st.metric("👥 Target Users", f"{safe_int(j.get('active_users')):,}")
     with m2:
-        st.metric("📨 Total Requests", f"{j['total_requests']:,}")
+        st.metric("📨 Total Requests", f"{safe_int(j.get('total_requests')):,}")
     with m3:
-        st.metric("⚡ RPS", f"{j['rps']:,.1f}")
+        st.metric("⚡ RPS", f"{safe_float(j.get('rps')):,.1f}")
     with m4:
-        st.metric("⏱ Elapsed Time", f"{j['elapsed_sec']}s / {j['total_duration']}s")
+        st.metric("⏱ Elapsed Time", f"{safe_int(j.get('elapsed_sec'))}s / {safe_int(j.get('total_duration'))}s")
 
     # Metrics row 2
     m5, m6, m7, m8 = st.columns(4)
     with m5:
-        st.metric("✅ Successful", f"{j['successful']:,}")
+        st.metric("✅ Successful", f"{safe_int(j.get('successful')):,}")
     with m6:
-        st.metric("❌ Failed", f"{j['failed']:,}")
+        st.metric("❌ Failed", f"{safe_int(j.get('failed')):,}")
     with m7:
-        st.metric("📊 Error Rate", f"{j['error_rate']:.2f}%")
+        st.metric("📊 Error Rate", f"{safe_float(j.get('error_rate')):.2f}%")
     with m8:
-        st.metric("🔥 5xx Errors", f"{j['status_5xx']:,}")
+        st.metric("🔥 5xx Errors", f"{safe_int(j.get('status_5xx')):,}")
 
     st.markdown("---")
 
@@ -755,22 +857,22 @@ if display_job:
     st.markdown("### ⏱ Response Times")
     r1, r2, r3, r4 = st.columns(4)
     with r1:
-        st.metric("Average", f"{j['avg_ms']} ms")
+        st.metric("Average", f"{safe_int(j.get('avg_ms'))} ms")
     with r2:
-        st.metric("P50 (Median)", f"{j['p50_ms']} ms")
+        st.metric("P50 (Median)", f"{safe_int(j.get('p50_ms'))} ms")
     with r3:
-        st.metric("P95", f"{j['p95_ms']} ms")
+        st.metric("P95", f"{safe_int(j.get('p95_ms'))} ms")
     with r4:
-        st.metric("P99 / Max", f"{j['p99_ms']} / {j['max_ms']} ms")
+        st.metric("P99 / Max", f"{safe_int(j.get('p99_ms'))} / {safe_int(j.get('max_ms'))} ms")
 
-    # Status codes row
+    # Status codes breakdown
     if status_codes:
         st.markdown("### 📋 Status Codes Breakdown")
         sc_cols = st.columns(min(len(status_codes), 6))
         for idx, (code, count) in enumerate(sorted(status_codes.items())):
             with sc_cols[idx % len(sc_cols)]:
-                tag = "✅" if code.isdigit() and 200 <= int(code) < 400 else "⚠️" if code.isdigit() and int(code) < 500 else "🔴"
-                st.metric(f"{tag} HTTP {code}", f"{count:,}")
+                tag = "✅" if str(code).isdigit() and 200 <= int(code) < 400 else "⚠️" if str(code).isdigit() and int(code) < 500 else "🔴"
+                st.metric(f"{tag} HTTP {code}", f"{safe_int(count):,}")
 
     st.markdown("---")
 
@@ -781,13 +883,6 @@ if display_job:
     escaped_logs = html.escape(logs_content)
     st.markdown(f'<div class="log-box">{escaped_logs}</div>', unsafe_allow_html=True)
 
-else:
-    st.info("👈 Enter a target URL in the sidebar and click **Start Test** to begin!")
 
-
-# ============================================
-# AUTO-REFRESH WHEN TEST IS RUNNING
-# ============================================
-if is_running and auto_refresh:
-    time.sleep(2.0)
-    st.rerun()
+# Render the live dashboard
+render_live_dashboard(display_job_id)
