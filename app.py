@@ -12,6 +12,7 @@ import asyncio
 import threading
 import sqlite3
 import json
+import html
 from datetime import datetime
 from collections import deque, defaultdict
 from typing import List, Tuple, Optional
@@ -141,22 +142,22 @@ def update_job_metrics(job_id: int, metrics: dict):
                 elapsed_sec = ?
             WHERE id = ?
         """, (
-            metrics["active_users"],
-            metrics["total_requests"],
-            metrics["successful"],
-            metrics["failed"],
-            metrics["status_5xx"],
-            metrics["timeouts"],
-            metrics["conn_errors"],
-            metrics["rps"],
-            metrics["error_rate"],
-            metrics["avg_response_ms"],
-            metrics["p50_ms"],
-            metrics["p95_ms"],
-            metrics["p99_ms"],
-            metrics["max_ms"],
+            metrics.get("active_users", 0),
+            metrics.get("total_requests", 0),
+            metrics.get("successful", 0),
+            metrics.get("failed", 0),
+            metrics.get("status_5xx", 0),
+            metrics.get("timeouts", 0),
+            metrics.get("conn_errors", metrics.get("connection_errors", 0)),
+            metrics.get("rps", 0.0),
+            metrics.get("error_rate", 0.0),
+            metrics.get("avg_response_ms", metrics.get("avg_ms", 0)),
+            metrics.get("p50_ms", 0),
+            metrics.get("p95_ms", 0),
+            metrics.get("p99_ms", 0),
+            metrics.get("max_ms", 0),
             json.dumps(metrics.get("status_codes", {})),
-            metrics["elapsed"],
+            metrics.get("elapsed", metrics.get("elapsed_sec", 0)),
             job_id
         ))
         conn.commit()
@@ -282,6 +283,7 @@ class LiveMetrics:
             "failed": self.failed,
             "status_5xx": self.status_5xx,
             "timeouts": self.timeouts,
+            "conn_errors": self.connection_errors,
             "connection_errors": self.connection_errors,
             "active_users": active_users,
             "rps": round(rps, 1),
@@ -298,6 +300,7 @@ class LiveMetrics:
             "max_ms": round(max(self.response_times) * 1000 if self.response_times else 0),
             "status_codes": dict(self.status_codes),
             "elapsed": round(elapsed),
+            "elapsed_sec": round(elapsed),
         }
 
 
@@ -403,8 +406,14 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
         enable_cleanup_closed=True,
     )
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             last_metric_update = 0.0
 
             while True:
@@ -767,9 +776,10 @@ if display_job:
 
     # Logs section
     st.markdown(f"### 📜 Live Logs (Job #{j['id']})")
-    logs = get_recent_logs(j["id"], limit=200)
+    logs = get_recent_logs(j["id"], limit=250)
     logs_content = "\n".join(logs) if logs else "No logs recorded yet for this job."
-    st.markdown(f'<div class="log-box">{logs_content}</div>', unsafe_allow_html=True)
+    escaped_logs = html.escape(logs_content)
+    st.markdown(f'<div class="log-box">{escaped_logs}</div>', unsafe_allow_html=True)
 
 else:
     st.info("👈 Enter a target URL in the sidebar and click **Start Test** to begin!")
