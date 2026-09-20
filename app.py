@@ -484,13 +484,14 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
     peak_simulated = max(u for _, u in stages)
 
     add_log(job_id, f"🚀 Job #{job_id} started: Target={target_url}")
-    add_log(job_id, f"⚙️ Config: Duration={total_duration}s | Target Users={peak_simulated:,} | Concurrency Cap={max_concurrency} tasks")
+    add_log(job_id, f"⚙️ Config: Duration={total_duration}s | Peak Users={peak_simulated:,} | Max Concurrency={max_concurrency:,} tasks")
 
-    # Safe TCPConnector limit prevents 'Errno 24: Too many open files' on container environments
+    # Unlimited connector for high-volume paid deployments
     connector = aiohttp.TCPConnector(
-        limit=max_concurrency,
-        limit_per_host=max_concurrency,
+        limit=0,
+        limit_per_host=0,
         ttl_dns_cache=300,
+        force_close=False,
         enable_cleanup_closed=True,
     )
 
@@ -515,16 +516,15 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
                     break
 
                 simulated_users = current_target(stages, elapsed)
-                # Scale actual worker tasks up to the user-defined max_concurrency cap
                 target_tasks = min(simulated_users, max_concurrency)
 
-                # Spawn worker tasks
+                # Batch spawn worker tasks (yield every 500 for event loop breathing room)
                 while len(active_tasks) < target_tasks:
                     t = asyncio.create_task(
                         virtual_user_worker(session, target_url, timeout_sec, metrics, stop_event)
                     )
                     active_tasks.append(t)
-                    if len(active_tasks) % 50 == 0:
+                    if len(active_tasks) % 500 == 0:
                         await asyncio.sleep(0)
 
                 # Despawn excess tasks
@@ -545,10 +545,10 @@ async def run_stress_test_async(job_id: int, target_url: str, stages: List[Tuple
                     )
                     log_line = (
                         f"⏱ {elapsed:>5.0f}s | "
-                        f"👥 Users: {simulated_users:>6,} | "
-                        f"⚡ Tasks: {len(active_tasks):>4} | "
-                        f"📨 Req: {metrics.total_requests:>8,} | "
-                        f"⚡ RPS: {rps:>7.1f} | "
+                        f"👥 Users: {simulated_users:>7,} | "
+                        f"⚡ Tasks: {len(active_tasks):>7,} | "
+                        f"📨 Req: {metrics.total_requests:>10,} | "
+                        f"⚡ RPS: {rps:>8.1f} | "
                         f"❌ Err: {err_rate:>5.2f}%"
                     )
                     add_log(job_id, log_line)
@@ -676,12 +676,12 @@ with st.sidebar:
     )
 
     max_concurrency = st.slider(
-        "⚡ Concurrency Cap (Worker Tasks)",
-        min_value=25,
-        max_value=500,
-        value=200,
-        step=25,
-        help="Maximum concurrent asynchronous tasks to prevent container crash / socket exhaustion on Streamlit Cloud.",
+        "⚡ Max Concurrent Users (Worker Tasks)",
+        min_value=100,
+        max_value=100000,
+        value=100000,
+        step=500,
+        help="Maximum concurrent async worker tasks. Paid Streamlit Cloud supports up to 100K.",
     )
 
     st.markdown("---")
